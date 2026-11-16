@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Offline tests for the framework v3 additions: access tiers, guests,
+"""Offline tests for the framework additions: personal-only routing,
 config hot reload, the actions runner and the admin API.
 
 Same style as test_bridge_offline.py: stub API, fabricated events, a
@@ -22,7 +22,6 @@ os.environ["QQ_BRIDGE_HOME"] = str(SCRATCH)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import daemon  # noqa: E402
-from guests import GuestStore  # noqa: E402
 from admin import AdminFacade, AdminServer  # noqa: E402
 from qqbot_agent_sdk import InboundEvent  # noqa: E402
 
@@ -88,14 +87,11 @@ def make_bridge(cfg_overrides=None):
 
 def fresh_dirs():
     for d in (daemon.INBOX, daemon.OUTBOX, daemon.PROACTIVE, daemon.DONE,
-              daemon.STATE, daemon.EVENTS, daemon.GUEST_INBOX, daemon.ACTIONS):
+              daemon.STATE, daemon.EVENTS, daemon.ACTIONS):
         d.mkdir(parents=True, exist_ok=True)
         for p in d.glob("*"):
             if p.is_file():
                 p.unlink()
-    for p in daemon.GUESTS_DIR.glob("*"):
-        if p.is_file():
-            p.unlink()
 
 
 def fake_event(msg_id="M1", sender="GUEST1", content="hi there", scope="c2c",
@@ -111,81 +107,52 @@ def patch_parser(bridge, event):
     bridge.parser = type("P", (), {"parse": staticmethod(lambda et, raw: event)})()
 
 
-async def t_guest_routing_public():
+async def t_personal_routing():
     fresh_dirs()
-    bridge, api = make_bridge({"access_mode": "public"})
-    patch_parser(bridge, fake_event(sender="GUEST1"))
-    await bridge.on_message_event("C2C_MESSAGE_CREATE", {"author": {}})
-    rec_file = daemon.GUEST_INBOX / "M1.json"
-    check("guest: public stranger lands in guest_inbox", rec_file.exists())
-    if rec_file.exists():
-        rec = json.loads(rec_file.read_text())
-        check("guest: record tier is guest", rec.get("tier") == "guest")
-    check("guest: owner inbox untouched", not (daemon.INBOX / "M1.json").exists())
-    hist = bridge.guests.history_path("GUEST1")
-    check("guest: history has the user turn",
-          hist.exists() and '"role": "user"' in hist.read_text())
+    bridge, api = make_bridge()
     patch_parser(bridge, fake_event(msg_id="M2", sender="OWNER1", chat_id="OWNER1"))
     await bridge.on_message_event("C2C_MESSAGE_CREATE", {"author": {}})
-    check("guest: owner still lands in owner inbox", (daemon.INBOX / "M2.json").exists())
-
-
-async def t_guest_routing_private_and_block():
-    fresh_dirs()
-    bridge, api = make_bridge({"access_mode": "private"})
-    patch_parser(bridge, fake_event(sender="GUEST2"))
+    rec_file = daemon.INBOX / "M2.json"
+    check("personal: owner lands in inbox", rec_file.exists())
+    if rec_file.exists():
+        rec = json.loads(rec_file.read_text())
+        check("personal: record tier is owner", rec.get("tier") == "owner")
+    patch_parser(bridge, fake_event(sender="STRANGER1"))
     await bridge.on_message_event("C2C_MESSAGE_CREATE", {"author": {}})
-    check("private: stranger dropped everywhere",
-          not (daemon.GUEST_INBOX / "M1.json").exists()
-          and not (daemon.INBOX / "M1.json").exists())
-    bridge2, _ = make_bridge({"access_mode": "public", "block_openids": ["BAD1"]})
-    patch_parser(bridge2, fake_event(sender="BAD1"))
+    check("personal: stranger dropped, no record anywhere",
+          not (daemon.INBOX / "M1.json").exists()
+          and not (daemon.DONE / "M1.json").exists())
+    bridge2, _ = make_bridge({"block_openids": ["OWNER1"]})
+    patch_parser(bridge2, fake_event(msg_id="M3", sender="OWNER1", chat_id="OWNER1"))
     await bridge2.on_message_event("C2C_MESSAGE_CREATE", {"author": {}})
-    check("public: blocklisted sender dropped",
-          not (daemon.GUEST_INBOX / "M1.json").exists())
+    check("personal: blocklisted sender dropped even if allowlisted",
+          not (daemon.INBOX / "M3.json").exists())
 
 
-async def t_guest_rate_limits():
-    store = GuestStore(SCRATCH / "guests-unit")
-    ok1, _ = store.check_and_count("U1", daily_limit=2, min_interval=0)
-    ok2, _ = store.check_and_count("U1", daily_limit=2, min_interval=0)
-    ok3, reason3 = store.check_and_count("U1", daily_limit=2, min_interval=0)
-    check("ratelimit: first two pass", ok1 and ok2)
-    check("ratelimit: third hits daily limit", not ok3 and reason3 == "daily_limit")
-    check("ratelimit: notice allowed once", store.should_notice_limit("U1"))
-    store.note_limit_notice("U1")
-    check("ratelimit: notice suppressed after send", not store.should_notice_limit("U1"))
-    okf, reasonf = store.check_and_count("U2", daily_limit=10, min_interval=3600)
-    okf2, reasonf2 = store.check_and_count("U2", daily_limit=10, min_interval=3600)
-    check("ratelimit: min interval enforced", okf and not okf2 and reasonf2 == "too_fast")
-
-
-async def t_guest_reply_flow():
+async def t_owner_reply_flow():
     fresh_dirs()
-    bridge, api = make_bridge({"access_mode": "public"})
-    patch_parser(bridge, fake_event(msg_id="G1", sender="GUEST9", content="hello bot"))
+    bridge, api = make_bridge()
+    patch_parser(bridge, fake_event(msg_id="G1", sender="OWNER1", chat_id="OWNER1",
+                                    content="hello bot"))
     await bridge.on_message_event("C2C_MESSAGE_CREATE", {"author": {}})
     (daemon.OUTBOX / "G1.json").write_text(
         json.dumps({"replies": ["hi human", "second part"]}), encoding="utf-8")
     await bridge._handle_outbox_file(daemon.OUTBOX / "G1.json")
     markers = list(daemon.DONE.glob("G1.SENT"))
-    check("guest reply: archived SENT", len(markers) == 1)
-    check("guest reply: both parts sent",
+    check("owner reply: archived SENT", len(markers) == 1)
+    check("owner reply: both parts sent",
           len([s for s in api.sent if s["route"] == "c2c"]) == 2)
-    hist = bridge.guests.history_path("GUEST9").read_text()
-    check("guest reply: assistant turns in history",
-          '"role": "assistant"' in hist and "second part" in hist)
-    check("guest reply: record left guest_inbox",
-          not (daemon.GUEST_INBOX / "G1.json").exists()
+    check("owner reply: record archived to done",
+          not (daemon.INBOX / "G1.json").exists()
           and (daemon.DONE / "G1.json").exists())
 
 
 def t_sanitize_config():
-    cfg, errors = daemon.sanitize_config({"access_mode": "public", "guest_daily_limit": 5})
-    check("sanitize: valid patch merges", not errors and cfg["access_mode"] == "public"
-          and cfg["guest_daily_limit"] == 5)
-    _, errors = daemon.sanitize_config({"access_mode": "bogus"})
-    check("sanitize: bad access_mode rejected", bool(errors))
+    cfg, errors = daemon.sanitize_config({"proactive_retries": 5, "typing": False})
+    check("sanitize: valid patch merges", not errors
+          and cfg["proactive_retries"] == 5 and cfg["typing"] is False)
+    _, errors = daemon.sanitize_config({"access_mode": "public"})
+    check("sanitize: removed guest-era key rejected as unknown", bool(errors))
     _, errors = daemon.sanitize_config({"nope_key": 1})
     check("sanitize: unknown key rejected", bool(errors))
     _, errors = daemon.sanitize_config({"allow_openids": "notalist"})
@@ -197,19 +164,19 @@ async def t_reload_config():
     bridge, _ = make_bridge()
     cfg_path = daemon.CONFIG_FILE
     new_cfg = dict(bridge.cfg)
-    new_cfg["guest_daily_limit"] = 7
+    new_cfg["proactive_retries"] = 7
     cfg_path.write_text(json.dumps(new_cfg), encoding="utf-8")
     # force a different mtime than the one captured at Bridge init
     os.utime(cfg_path, (1_900_000_000, 1_900_000_000))
     changed = bridge.reload_config()
-    check("reload: changed config swapped in", changed and bridge.cfg["guest_daily_limit"] == 7)
+    check("reload: changed config swapped in", changed and bridge.cfg["proactive_retries"] == 7)
     bad = dict(bridge.cfg)
-    bad["access_mode"] = "bogus"
+    bad["typing"] = "yes"
     cfg_path.write_text(json.dumps(bad), encoding="utf-8")
     os.utime(cfg_path, (1_900_000_100, 1_900_000_100))
     changed2 = bridge.reload_config()
     check("reload: invalid config rejected, old kept",
-          not changed2 and bridge.cfg["access_mode"] == "private")
+          not changed2 and bridge.cfg["typing"] is True)
     cfg_path.unlink()
 
 
@@ -248,10 +215,9 @@ def t_admin_http():
         return True, "queued"
 
     facade = AdminFacade(
-        status=lambda: {"pid": 1, "access_mode": "private"},
+        status=lambda: {"pid": 1},
         get_config=lambda: dict(daemon.DEFAULT_CONFIG),
         put_config=put_config,
-        guests=lambda: [],
         events_tail=lambda n: [],
         queue_push=queue_push,
     )
@@ -274,7 +240,7 @@ def t_admin_http():
         check("admin: no token -> 401", code == 401)
         code, body = call("GET", "/api/status", token="test-token")
         check("admin: status ok with token", code == 200 and body.get("pid") == 1)
-        code, _ = call("PUT", "/api/config", {"guest_daily_limit": 9}, token="test-token")
+        code, _ = call("PUT", "/api/config", {"proactive_retries": 9}, token="test-token")
         check("admin: valid config put ok", code == 200 and calls["put"])
         code, _ = call("PUT", "/api/config", {"evil_key": 1}, token="test-token")
         check("admin: unknown key -> 400", code == 400)
@@ -315,10 +281,8 @@ async def t_actions_v32():
 
 
 async def main():
-    await t_guest_routing_public()
-    await t_guest_routing_private_and_block()
-    await t_guest_rate_limits()
-    await t_guest_reply_flow()
+    await t_personal_routing()
+    await t_owner_reply_flow()
     t_sanitize_config()
     await t_reload_config()
     await t_actions()

@@ -1,15 +1,13 @@
 """Localhost admin API for the QQ bot framework.
 
 A tiny stdlib-only HTTP server bound to 127.0.0.1.  It exists so the
-owner (and front-ends like the Muse Space config panel, when they run
-on the same machine) can inspect status and change configuration
-without editing files by hand:
+owner's agent can inspect status and change configuration without
+editing files by hand:
 
     GET  /api/status    daemon + gateway status, counters
     GET  /api/config    effective config (credentials are never in it)
     PUT  /api/config    validate + persist a config patch; the daemon
                         hot-reloads it within seconds
-    GET  /api/guests    guest list with today's counts
     GET  /api/events?n= last N lifecycle/interaction events
     POST /api/push      queue a proactive message {scene,target,content}
 
@@ -36,14 +34,12 @@ class AdminFacade:
         status: Callable[[], dict],
         get_config: Callable[[], dict],
         put_config: Callable[[dict], tuple],
-        guests: Callable[[], list],
         events_tail: Callable[[int], list],
         queue_push: Callable[[dict], tuple],
     ) -> None:
         self.status = status
         self.get_config = get_config
         self.put_config = put_config
-        self.guests = guests
         self.events_tail = events_tail
         self.queue_push = queue_push
 
@@ -107,8 +103,6 @@ class AdminServer(threading.Thread):
                     self._send(200, facade_ref.status())
                 elif self.path == "/api/config":
                     self._send(200, facade_ref.get_config())
-                elif self.path == "/api/guests":
-                    self._send(200, {"guests": facade_ref.guests()})
                 elif self.path.startswith("/api/events"):
                     n = 50
                     if "n=" in self.path:

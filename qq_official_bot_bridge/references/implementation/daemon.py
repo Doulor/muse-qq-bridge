@@ -108,7 +108,6 @@ from qqbot_agent_sdk.dto import (
 )
 from qqbot_agent_sdk.media_loader import MediaUploader
 
-from guests import GuestStore
 from qqapi import QQApi
 from admin import AdminFacade, AdminServer, ensure_token
 
@@ -120,9 +119,7 @@ EVENTS = BASE / "events"
 DONE = BASE / "done"
 LOGS = BASE / "logs"
 STATE = BASE / "state"
-GUEST_INBOX = BASE / "guest_inbox"
 ACTIONS = BASE / "actions"
-GUESTS_DIR = BASE / "guests"
 CREDENTIALS_FILE = Path(
     os.environ.get("QQ_BRIDGE_CREDENTIALS", str(BASE / "credentials.env"))
 )
@@ -130,7 +127,7 @@ CONFIG_FILE = Path(
     os.environ.get("QQ_BRIDGE_CONFIG", str(BASE / "config.json"))
 )
 
-OUTBOX_POLL_SECONDS = 3.0
+OUTBOX_POLL_SECONDS = 1.0
 ASR_TIMEOUT_SECONDS = 25.0
 
 MEDIA_KIND_TO_TYPE = {
@@ -225,22 +222,10 @@ DEFAULT_CONFIG: dict = {
     # platform-side group full-message permission).
     "group_full_messages": False,
     # ── framework v3 ──────────────────────────────────────────────────
-    # Access tiers for C2C: "private" = owner allowlist only (default);
-    # "public" = non-allowlist senders become rate-limited guests whose
-    # messages land in guest_inbox/ for a restricted worker.
-    "access_mode": "private",
-    # Always dropped, in every mode, before any other check.
+    # Personal-only bot: C2C senders must be on allow_openids (or the
+    # bridge is in binding mode while the allowlist is empty).
+    # block_openids are always dropped, before any other check.
     "block_openids": [],
-    # Guest budget: messages per guest per day (0 = unlimited) and the
-    # minimum seconds between two guest messages.
-    "guest_daily_limit": 30,
-    "guest_min_interval_seconds": 3,
-    # In public mode, greet a brand-new friend with one proactive
-    # message (best effort) when FRIEND_ADD arrives.
-    "guest_welcome_enabled": False,
-    "guest_welcome_text": "你好，我是 Ruben_muse，可以陪你聊天。直接发消息给我就行。",
-    # Text of the once-a-day over-limit notice for guests.
-    "guest_limit_text": "今天的聊天额度用完啦，明天再来找我玩。",
     # Master switch for the proactive/ directory (weather, reminders).
     "proactive_enabled": True,
     # Transcribe inbound voice attachments (platform ASR / STT pipeline).
@@ -269,15 +254,14 @@ def load_config() -> dict:
 
 
 _LIST_KEYS = ("allow_openids", "allow_group_member_openids", "block_openids")
-_BOOL_KEYS = ("typing", "group_full_messages", "guest_welcome_enabled", "actions_enabled",
+_BOOL_KEYS = ("typing", "group_full_messages", "actions_enabled",
               "proactive_enabled", "voice_asr")
 _INT_KEYS = (
     "reply_window_seconds", "max_replies_per_message", "proactive_retries",
-    "proactive_retry_delay_seconds", "guest_daily_limit",
-    "guest_min_interval_seconds", "heartbeat_seconds",
+    "proactive_retry_delay_seconds", "heartbeat_seconds",
     "liveness_timeout_seconds", "admin_port",
 )
-_STR_KEYS = ("access_mode", "guest_welcome_text", "guest_limit_text")
+_STR_KEYS: tuple = ()
 
 
 def sanitize_config(raw: dict, base: Optional[dict] = None) -> tuple:
@@ -307,9 +291,6 @@ def sanitize_config(raw: dict, base: Optional[dict] = None) -> tuple:
         elif key in _STR_KEYS:
             if not isinstance(value, str):
                 errors.append(f"{key} must be a string")
-                continue
-            if key == "access_mode" and value not in ("private", "public"):
-                errors.append("access_mode must be 'private' or 'public'")
                 continue
         cfg[key] = value
     return cfg, errors
@@ -577,7 +558,6 @@ class Bridge:
             STATE, int(config["max_replies_per_message"])
         )
         self.wakeup = WakeupBook(STATE)
-        self.guests = GuestStore(GUESTS_DIR)
         self.qq = QQApi(api)
         self.started_at = time.time()
         try:
@@ -624,8 +604,8 @@ class Bridge:
         self.cfg = fresh
         self.ledger._max = int(fresh["max_replies_per_message"])
         logger.info(
-            "config hot-reloaded (access_mode=%s, allow=%d)",
-            fresh.get("access_mode"), len(fresh.get("allow_openids", [])),
+            "config hot-reloaded (allow=%d)",
+            len(fresh.get("allow_openids", [])),
         )
         return True
 
@@ -707,22 +687,6 @@ class Bridge:
             "received_at": datetime.now(timezone.utc).isoformat(),
         })
         logger.info("lifecycle event logged: %s", event_type)
-        if (
-            event_type == "FRIEND_ADD"
-            and self.cfg.get("access_mode") == "public"
-            and self.cfg.get("guest_welcome_enabled")
-        ):
-            openid = str(raw.get("openid") or "")
-            if openid:
-                _write_json_atomic(
-                    PROACTIVE / f"welcome-{openid[:12]}.json",
-                    {
-                        "scene": "c2c",
-                        "target": openid,
-                        "content": str(self.cfg.get("guest_welcome_text", "")),
-                    },
-                )
-                logger.info("queued welcome message for new friend %s...", openid[:8])
 
     # -- inbound ---------------------------------------------------------
 
@@ -803,11 +767,10 @@ class Bridge:
             logger.warning("dropping message with unsafe id %r", msg_id)
             return
 
-        # Access tiers, enforced here so strangers never wake the
-        # owner worker.  C2C order: blocklist, binding mode (empty
-        # allowlist), owner allowlist, then — in public mode only —
-        # rate-limited guests.
-        tier = "owner"
+        # Personal-only gate, enforced here so strangers never wake
+        # the owner worker.  C2C order: blocklist, binding mode
+        # (empty allowlist), owner allowlist — anything else is
+        # dropped silently.
         if event.chat_scope == "c2c":
             self.wakeup.touch(sender)
             if sender in [str(x) for x in self.cfg.get("block_openids", [])]:
@@ -818,29 +781,15 @@ class Bridge:
                 await self._handle_unbound(sender, msg_id, content)
                 return
             if sender not in allow:
-                if str(self.cfg.get("access_mode", "private")) != "public":
-                    logger.info("c2c sender %s... not in allowlist; dropped", sender[:8])
-                    return
-                tier = "guest"
-                ok, reason = self.guests.check_and_count(
-                    sender,
-                    int(self.cfg.get("guest_daily_limit", 30)),
-                    float(self.cfg.get("guest_min_interval_seconds", 3)),
-                )
-                if not ok:
-                    logger.info("guest %s... rate limited (%s)", sender[:8], reason)
-                    if reason == "daily_limit" and self.guests.should_notice_limit(sender):
-                        self.guests.note_limit_notice(sender)
-                        asyncio.create_task(self._send_limit_notice(sender, msg_id))
-                    return
+                logger.info("c2c sender %s... not in allowlist; dropped", sender[:8])
+                return
         elif event.chat_scope == "group":
             allow_g = [str(x) for x in self.cfg.get("allow_group_member_openids", [])]
             if allow_g and sender not in allow_g:
                 logger.info("group sender %s... not in allowlist; dropped", sender[:8])
                 return
 
-        home_dir = GUEST_INBOX if tier == "guest" else INBOX
-        target = home_dir / f"{msg_id}.json"
+        target = INBOX / f"{msg_id}.json"
         if target.exists() or (DONE / f"{msg_id}.json").exists():
             return  # duplicate delivery
         record: dict = {
@@ -856,7 +805,7 @@ class Bridge:
             "attachments": attachments,
             "attachment_only": not content and bool(attachments),
             "received_at": datetime.now(timezone.utc).isoformat(),
-            "tier": tier,
+            "tier": "owner",
         }
         if event_type == "GROUP_MESSAGE_CREATE":
             record["full_message"] = True
@@ -885,16 +834,11 @@ class Bridge:
                 if asr_note:
                     record["asr_note"] = asr_note
                 break
-        tmp = home_dir / f".{msg_id}.tmp"
+        tmp = INBOX / f".{msg_id}.tmp"
         tmp.write_text(
             json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         tmp.rename(target)
-        if tier == "guest":
-            self.guests.mark_message(msg_id, sender)
-            self.guests.append_history(
-                sender, "user", content or "[附件消息]", msg_id
-            )
         logger.info(
             "inbox: %s message %s from %s (%d chars, %d attachment(s))",
             record["scene"],
@@ -905,19 +849,6 @@ class Bridge:
         )
         if event.chat_scope == "c2c" and self.cfg["typing"]:
             asyncio.create_task(self._send_typing(sender, msg_id))
-
-    async def _send_limit_notice(self, user_openid: str, msg_id: str) -> None:
-        """Best-effort 'daily budget spent' reply for a guest."""
-        try:
-            await self.api.send_text(
-                "c2c",
-                user_openid,
-                str(self.cfg.get("guest_limit_text") or "今天的聊天额度用完啦，明天再来找我玩。"),
-                reply_to=msg_id,
-                markdown=False,
-            )
-        except Exception:
-            logger.debug("limit notice failed for %s...", user_openid[:8], exc_info=True)
 
     async def _send_typing(self, user_openid: str, msg_id: str) -> None:
         """Best-effort typing indicator for C2C conversations."""
@@ -1118,10 +1049,6 @@ class Bridge:
             return  # still being written; retry on the next poll
         inbox_file = INBOX / f"{msg_id}.json"
         if not inbox_file.exists():
-            guest_file = GUEST_INBOX / f"{msg_id}.json"
-            if guest_file.exists():
-                inbox_file = guest_file
-        if not inbox_file.exists():
             logger.warning(
                 "outbox %s has no matching inbox record; archiving as orphan",
                 msg_id,
@@ -1210,22 +1137,11 @@ class Bridge:
             sent_parts += 1
             self._set_progress(f"outbox:{msg_id}", {"sent_parts": sent_parts})
         logger.info("sent reply for %s (%d part(s))", msg_id, len(parts))
-        if record.get("tier") == "guest":
-            for part in parts:
-                text = part.get("text") or ""
-                if text:
-                    self.guests.append_history(
-                        str(record.get("user_openid")), "assistant", text, msg_id
-                    )
         self._archive(msg_id, "SENT")
 
     def _archive(self, msg_id: str, marker: str, note: str = "") -> None:
         DONE.mkdir(parents=True, exist_ok=True)
         inbox_file = INBOX / f"{msg_id}.json"
-        if not inbox_file.exists():
-            guest_file = GUEST_INBOX / f"{msg_id}.json"
-            if guest_file.exists():
-                inbox_file = guest_file
         outbox_file = OUTBOX / f"{msg_id}.json"
         if inbox_file.exists():
             inbox_file.rename(DONE / f"{msg_id}.json")
@@ -1300,7 +1216,7 @@ class Bridge:
                             await self._handle_action_file(path)
             except Exception:
                 logger.exception("actions scan failed")
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(1.0)
 
     async def _handle_action_file(self, path: Path) -> None:
         try:
@@ -1471,14 +1387,10 @@ class Bridge:
         while True:
             try:
                 pending = sum(1 for p in INBOX.glob("*.json") if not p.name.startswith("."))
-                guest_pending = sum(1 for p in GUEST_INBOX.glob("*.json") if not p.name.startswith("."))
                 _write_json_atomic(STATE / "heartbeat.json", {
                     "ts": time.time(),
                     "pid": os.getpid(),
                     "inbox_pending": pending,
-                    "guest_inbox_pending": guest_pending,
-                    "access_mode": self.cfg.get("access_mode", "private"),
-                    "guests": self.guests.guest_count(),
                     "uptime_s": round(time.time() - self.started_at),
                 })
             except Exception:
@@ -1488,7 +1400,7 @@ class Bridge:
 
 async def main() -> int:
     for directory in (INBOX, OUTBOX, PROACTIVE, EVENTS, DONE, LOGS, STATE,
-                      GUEST_INBOX, ACTIONS, GUESTS_DIR):
+                      ACTIONS):
         directory.mkdir(parents=True, exist_ok=True)
     setup_logging()
     config = load_config()
@@ -1640,16 +1552,12 @@ async def main() -> int:
             status=lambda: {
                 "pid": os.getpid(),
                 "uptime_s": round(time.time() - bridge.started_at),
-                "access_mode": bridge.cfg.get("access_mode", "private"),
                 "allow_count": len(bridge.cfg.get("allow_openids", [])),
                 "inbox_pending": sum(1 for p in INBOX.glob("*.json")),
-                "guest_inbox_pending": sum(1 for p in GUEST_INBOX.glob("*.json")),
-                "guests": bridge.guests.guest_count(),
                 "gateway_ready": bool(bridge.bot_openids),
             },
             get_config=lambda: dict(bridge.cfg),
             put_config=_put_config,
-            guests=bridge.guests.list_guests,
             events_tail=_events_tail,
             queue_push=_queue_push,
         )

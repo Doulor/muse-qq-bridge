@@ -27,7 +27,7 @@
 - 备选手动绑定。把 `credentials.env.example` 复制为 `credentials.env`，填 AppID 与 AppSecret，同样设 0600。
 - 永远不把 AppSecret 写进聊天或日志。汇报绑定结果只报 AppID 的掩码形式。
 - 主人白名单在 `config.json` 的 `allow_openids`。守护进程在入箱前就验。名单为空时是绑定模式：第一位发信人的 openid 记入 `state/pending.json` 并回一句未绑定提示，他的内容不入箱；由用户在主聊天确认后把该 openid 填进 `allow_openids` 并重启 daemon。群消息的发信人是群内 member_openid（与私聊 openid 不是一套），用 `allow_group_member_openids` 单独管，留空表示群内成员都可达。
-- 私聊发信人不在白名单时的去向由 `access_mode` 决定（见下节「框架 v3」）：`private`（默认）直接丢弃；`public` 时成为访客，进 `guest_inbox/` 给受限的访客 worker。`block_openids` 在任何模式下都最先丢弃。
+- 私聊发信人不在白名单时一律在守护进程层直接丢弃：不入箱、不唤醒、不回复。`block_openids` 比白名单更优先（在白名单里但被拉黑也丢弃）。这只机器人只服务主人一个人，没有访客/多人路径。
 
 ## 守护进程的职责与 SDK 缺口
 
@@ -40,16 +40,13 @@
 - 按钮交互用 `acknowledge_interaction` 确认。C2C 消息入箱时发 `send_typing` 给用户即时反馈（`config.json` 的 `typing` 可关）——即时反馈用输入状态，不要发预设文案占回复额度。
 - 网关存活自检。SDK 的重连在连接掉线后可能假死（进程还在、心跳 ACK 不再来），daemon 记录最后一次心跳 ACK 时刻，静默超过 `liveness_timeout_seconds`（默认 300）就硬退出，交给监督层拉起新进程。另有 `state/heartbeat.json` 每 20 秒刷新，供看门狗判活。
 
-## 框架 v3：权限分层、访客、动作与管理接口
+## 框架 v3：个人专用、动作与管理接口
 
-- **权限三层**。owner（`allow_openids`）走 `inbox/`，完整 agent 处理；guest（public 模式下的其他私聊发信人）走 `guest_inbox/`，由访客 worker 处理；blocked（`block_openids`）静默丢弃。记录里带 `tier` 字段，owner 的 inbox 出现 guest 记录就是路由 bug。
-- **访客 worker 是隔离的**：用 `references/guest-hook-prompt.txt` 那份提示词唤醒——它的人格只有公开人设卡，手里没有主人的任何私人信息（不是叮嘱保密，是根本不给），不能用工具、不能主动发消息，只能写 outbox 回复和维护这个访客自己的记忆。给访客 worker 喂任何主人记忆都算事故。
-- **访客记忆**在 `guests/` 目录：`<openid>.history.jsonl` 是完整对话流水（daemon 自动记双方，回复成功时把发出的每条记为 assistant）；`<openid>.notes.md` 由访客 worker 维护，只记这个访客本人的事；`guests/persona.md` 存在时是主人定的人设补充，访客 worker 先读它。`guests/state.json` 是限流与消息索引的内部状态，不要手改。
-- **访客限流在 daemon 层**：`guest_daily_limit`（默认 30，0=不限）与 `guest_min_interval_seconds`（默认 3）。超限的消息不入箱、不唤醒 worker；撞到每日上限时 daemon 直接回一句额度用完的提示，每人每天最多提示一次。
+- **只服务主人一人**。C2C 入箱前的检查顺序：`block_openids` 命中直接丢弃 → 白名单为空走绑定模式 → 在 `allow_openids` 里才进 `inbox/`（记录 `"tier": "owner"`）→ 其余一律丢弃，不入箱、不唤醒、不回复。v3 早期曾有 public 访客模式（guest_inbox/访客 worker/限流/独立记忆），2026-11-17 按主人决定整体移除：代码、配置键、hook、管理口访客端点都已删净，不要再按访客模式的假设写任何东西。
 - **动作目录 `actions/`**：owner agent 除了被动回复，还能驱动 QQ API——放 `{"action": "send_group", "args": {...}}` 这类文件，daemon 按 `daemon.py` 的 `ACTION_NAMES` 白名单执行 `qqapi.py` 里的方法，结果写 `done/<文件名>.result.json`（含 ok 与 result/error）。覆盖发送/撤回（四场景）、富媒体文件上传、私信会话、频道与成员与角色管理、公告、精华、日程、表态、论坛、音频等 api-v2 接口；签名以 `qqapi.py` 为准，不要凭记忆编参数。频道管理类接口还需要机器人在频道里有对应权限，平台会拒，没权限就如实报错误。
 - **配置热加载**：daemon 每 5 秒看一次 `config.json` 的 mtime，变了就校验并整体换入（非法值整份拒绝、保留旧配置并记日志）。改配置不用重启；凭据不在热加载范围。
-- **本地管理接口**：`admin_port` > 0 时 daemon 在 127.0.0.1 起一个 HTTP 管理口（`admin.py`，令牌在 `state/admin.token`，请求头 `X-Admin-Token`）：`GET /api/status`、`/api/config`、`/api/guests`、`/api/events?n=`，`PUT /api/config`（走同一套校验），`POST /api/push`（排一条主动消息）。只绑回环，不要往外暴露。
-- **访客 hook**：`hooks/qq-bridge-guest-inbox.sh` 与主人 inbox hook 同款两段式投递（pending 先提交再 peek），指向 `guest_inbox/`，唤醒访客 worker。主人 hook 与访客 hook 必须用各自的提示词，不要混用。
+- **本地管理接口**：`admin_port` > 0 时 daemon 在 127.0.0.1 起一个 HTTP 管理口（`admin.py`，令牌在 `state/admin.token`，请求头 `X-Admin-Token`）：`GET /api/status`、`/api/config`、`/api/events?n=`，`PUT /api/config`（走同一套校验），`POST /api/push`（排一条主动消息）。只绑回环，不要往外暴露。
+- **速度基线**：daemon 侧 outbox/proactive/actions 三个扫描循环都是 1 秒一轮；消息入箱即发 typing；唤醒延迟的大头在 hook 轮询（5 秒是平台下限）。不要把扫描间隔再往上调。
 - **v3.2（2026-11-17 按官方 api-v2 全景目录对账后补齐）**：动作新增 C2C 自定义菜单（`get_menu`/`put_menu`）、指令面板（`list_panels` 等 6 个）、分片上传（prepare/part_finish，C2C 与群各一对）、C2C 流式消息透传（`stream_c2c_message`）、频道接口权限（`get_guild_api_permission`/`demand_guild_api_permission`）、整套群管理（群信息/机器人状态/入群审批/成员禁言/自动审批策略/成员与黑名单——多数要白名单或机器人是群管理员，没权限平台会以 11253/11282 拒绝，如实报）；生命周期事件补录 MESSAGE_REACTION_*、MESSAGE_DELETE、AUDIO_*、SUBSCRIBE_MESSAGE_STATUS、GROUP_JOIN_REQUEST、GROUP_MEMBER_* 等。全景目录见 `references/api-v2-catalog.md`（92 个端点、49+2 个事件，含各 intent 位与权限门槛）。注意：未经平台申请的 intent 不能写进 Identify，未授权 intent 会被平台直接断连（4014）；新事件能否真正收到取决于机器人获批的 intent，不是代码问题。
 
 ## 回信契约（agent 写 outbox）
@@ -75,7 +72,7 @@
 
 ## 验收与排障
 
-- 离线自检：`.venv/bin/python tests/test_bridge_offline.py`（33 项：白名单、绑定、拆条序号去重、额度、过期、重试、致命错误、媒体校验、主动消息重试与召回周期）与 `.venv/bin/python tests/test_framework_offline.py`（31 项：访客分流、黑名单、限流、访客回复与记忆落盘、配置校验与热加载、动作执行、管理接口鉴权）。不联网不用凭据，两套都要全过。
-- 真机验收顺序：绑定模式确认 pending → 填白名单重启 → 私聊文字往返 → 拆条回复 → 图片附件入箱 → 语音转写 → 主动推送（push.py）→ 杀掉 daemon 看 watchdog 拉起。框架 v3 追加：管理口改 `access_mode` 为 public 并把测试号移出白名单 → 以访客身份聊天（入 guest_inbox、回复、history 落盘）→ 连发撞每日上限看提示 → 动作文件调 `get_bot_info` 看 result。
+- 离线自检：`.venv/bin/python tests/test_bridge_offline.py`（33 项：白名单、绑定、拆条序号去重、额度、过期、重试、致命错误、媒体校验、主动消息重试与召回周期）与 `.venv/bin/python tests/test_framework_offline.py`（29 项：个人路由（陌生人丢弃、黑名单优先）、owner 回复流、配置校验与热加载、动作执行、管理接口鉴权）。不联网不用凭据，两套都要全过。
+- 真机验收顺序：绑定模式确认 pending → 填白名单重启 → 私聊文字往返 → 拆条回复 → 图片附件入箱 → 语音转写 → 主动推送（push.py）→ 杀掉 daemon 看 watchdog 拉起 → 动作文件调 `get_bot_info` 看 result → 非白名单号发一条，确认 daemon 日志是 dropped 且无任何回复。
 - 排障先看三处：`logs/daemon.log`（收发与错误原文）、`done/` 里的标记文件（每条消息的最终结局）、`state/heartbeat.json`（daemon 是否还活着）。网关连不上先查代理环境变量与 NO_PROXY 清洗是否生效。
 - 图片附件的 CDN（multimedia.nt.qq.com.cn）在某些机器上从 shell 网络拉不动（代理 TLS 停滞），这种情况让被唤醒的 agent 改走浏览器取图，别在 shell 里反复 curl 烧回复窗口。
