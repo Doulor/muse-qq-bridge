@@ -26,7 +26,8 @@
 - 首选扫码绑定。在 `qr-connect/` 里装 `@tencent-connect/qqbot-connector` 1.2.0 与 `qrcode`，跑 `connect.mjs` 生成 `qr.png` 给用户扫，成功回调把凭据写进 `credentials.env` 并设权限 0600。密钥全程不经过聊天。
 - 备选手动绑定。把 `credentials.env.example` 复制为 `credentials.env`，填 AppID 与 AppSecret，同样设 0600。
 - 永远不把 AppSecret 写进聊天或日志。汇报绑定结果只报 AppID 的掩码形式。
-- 主人白名单在 `config.json` 的 `allow_openids`。守护进程在入箱前就验：不在名单里的私聊发信人直接丢弃，不唤醒 agent。名单为空时是绑定模式：第一位发信人的 openid 记入 `state/pending.json` 并回一句未绑定提示，他的内容不入箱；由用户在主聊天确认后把该 openid 填进 `allow_openids` 并重启 daemon。群消息的发信人是群内 member_openid（与私聊 openid 不是一套），用 `allow_group_member_openids` 单独管，留空表示群内成员都可达。
+- 主人白名单在 `config.json` 的 `allow_openids`。守护进程在入箱前就验。名单为空时是绑定模式：第一位发信人的 openid 记入 `state/pending.json` 并回一句未绑定提示，他的内容不入箱；由用户在主聊天确认后把该 openid 填进 `allow_openids` 并重启 daemon。群消息的发信人是群内 member_openid（与私聊 openid 不是一套），用 `allow_group_member_openids` 单独管，留空表示群内成员都可达。
+- 私聊发信人不在白名单时的去向由 `access_mode` 决定（见下节「框架 v3」）：`private`（默认）直接丢弃；`public` 时成为访客，进 `guest_inbox/` 给受限的访客 worker。`block_openids` 在任何模式下都最先丢弃。
 
 ## 守护进程的职责与 SDK 缺口
 
@@ -38,6 +39,17 @@
 - 语音走 SDK 的 STTPipeline。未配置 STT 引擎时回退平台自带的 `asr_refer_text`，转写不到就如实标 `asr_text` 为 null 并在 `asr_note` 写原因，不伪造转写。
 - 按钮交互用 `acknowledge_interaction` 确认。C2C 消息入箱时发 `send_typing` 给用户即时反馈（`config.json` 的 `typing` 可关）——即时反馈用输入状态，不要发预设文案占回复额度。
 - 网关存活自检。SDK 的重连在连接掉线后可能假死（进程还在、心跳 ACK 不再来），daemon 记录最后一次心跳 ACK 时刻，静默超过 `liveness_timeout_seconds`（默认 300）就硬退出，交给监督层拉起新进程。另有 `state/heartbeat.json` 每 20 秒刷新，供看门狗判活。
+
+## 框架 v3：权限分层、访客、动作与管理接口
+
+- **权限三层**。owner（`allow_openids`）走 `inbox/`，完整 agent 处理；guest（public 模式下的其他私聊发信人）走 `guest_inbox/`，由访客 worker 处理；blocked（`block_openids`）静默丢弃。记录里带 `tier` 字段，owner 的 inbox 出现 guest 记录就是路由 bug。
+- **访客 worker 是隔离的**：用 `references/guest-hook-prompt.txt` 那份提示词唤醒——它的人格只有公开人设卡，手里没有主人的任何私人信息（不是叮嘱保密，是根本不给），不能用工具、不能主动发消息，只能写 outbox 回复和维护这个访客自己的记忆。给访客 worker 喂任何主人记忆都算事故。
+- **访客记忆**在 `guests/` 目录：`<openid>.history.jsonl` 是完整对话流水（daemon 自动记双方，回复成功时把发出的每条记为 assistant）；`<openid>.notes.md` 由访客 worker 维护，只记这个访客本人的事；`guests/persona.md` 存在时是主人定的人设补充，访客 worker 先读它。`guests/state.json` 是限流与消息索引的内部状态，不要手改。
+- **访客限流在 daemon 层**：`guest_daily_limit`（默认 30，0=不限）与 `guest_min_interval_seconds`（默认 3）。超限的消息不入箱、不唤醒 worker；撞到每日上限时 daemon 直接回一句额度用完的提示，每人每天最多提示一次。
+- **动作目录 `actions/`**：owner agent 除了被动回复，还能驱动 QQ API——放 `{"action": "send_group", "args": {...}}` 这类文件，daemon 按 `daemon.py` 的 `ACTION_NAMES` 白名单执行 `qqapi.py` 里的方法，结果写 `done/<文件名>.result.json`（含 ok 与 result/error）。覆盖发送/撤回（四场景）、富媒体文件上传、私信会话、频道与成员与角色管理、公告、精华、日程、表态、论坛、音频等 api-v2 接口；签名以 `qqapi.py` 为准，不要凭记忆编参数。频道管理类接口还需要机器人在频道里有对应权限，平台会拒，没权限就如实报错误。
+- **配置热加载**：daemon 每 5 秒看一次 `config.json` 的 mtime，变了就校验并整体换入（非法值整份拒绝、保留旧配置并记日志）。改配置不用重启；凭据不在热加载范围。
+- **本地管理接口**：`admin_port` > 0 时 daemon 在 127.0.0.1 起一个 HTTP 管理口（`admin.py`，令牌在 `state/admin.token`，请求头 `X-Admin-Token`）：`GET /api/status`、`/api/config`、`/api/guests`、`/api/events?n=`，`PUT /api/config`（走同一套校验），`POST /api/push`（排一条主动消息）。只绑回环，不要往外暴露。
+- **访客 hook**：`hooks/qq-bridge-guest-inbox.sh` 与主人 inbox hook 同款两段式投递（pending 先提交再 peek），指向 `guest_inbox/`，唤醒访客 worker。主人 hook 与访客 hook 必须用各自的提示词，不要混用。
 
 ## 回信契约（agent 写 outbox）
 
@@ -62,7 +74,7 @@
 
 ## 验收与排障
 
-- 离线自检：`.venv/bin/python tests/test_bridge_offline.py`，不联网不用凭据，覆盖白名单、绑定、拆条序号去重、额度、过期、重试、致命错误、媒体校验、主动消息重试与召回周期，共 33 项。
-- 真机验收顺序：绑定模式确认 pending → 填白名单重启 → 私聊文字往返 → 拆条回复 → 图片附件入箱 → 语音转写 → 主动推送（push.py）→ 杀掉 daemon 看 watchdog 拉起。
+- 离线自检：`.venv/bin/python tests/test_bridge_offline.py`（33 项：白名单、绑定、拆条序号去重、额度、过期、重试、致命错误、媒体校验、主动消息重试与召回周期）与 `.venv/bin/python tests/test_framework_offline.py`（31 项：访客分流、黑名单、限流、访客回复与记忆落盘、配置校验与热加载、动作执行、管理接口鉴权）。不联网不用凭据，两套都要全过。
+- 真机验收顺序：绑定模式确认 pending → 填白名单重启 → 私聊文字往返 → 拆条回复 → 图片附件入箱 → 语音转写 → 主动推送（push.py）→ 杀掉 daemon 看 watchdog 拉起。框架 v3 追加：管理口改 `access_mode` 为 public 并把测试号移出白名单 → 以访客身份聊天（入 guest_inbox、回复、history 落盘）→ 连发撞每日上限看提示 → 动作文件调 `get_bot_info` 看 result。
 - 排障先看三处：`logs/daemon.log`（收发与错误原文）、`done/` 里的标记文件（每条消息的最终结局）、`state/heartbeat.json`（daemon 是否还活着）。网关连不上先查代理环境变量与 NO_PROXY 清洗是否生效。
 - 图片附件的 CDN（multimedia.nt.qq.com.cn）在某些机器上从 shell 网络拉不动（代理 TLS 停滞），这种情况让被唤醒的 agent 改走浏览器取图，别在 shell 里反复 curl 烧回复窗口。

@@ -85,8 +85,11 @@ QQ 用户 ──消息──▶ QQ 开放平台 ──WebSocket 网关──▶ 
 
 | 路径 | 用途 |
 |---|---|
-| `inbox/` | 待回复的消息，记录结构见下 |
+| `inbox/` | 待回复的消息（owner），记录结构见下 |
+| `guest_inbox/` | 待回复的访客消息（public 模式），记录同 inbox 并带 `"tier": "guest"` |
+| `guests/` | 访客记忆：`<openid>.history.jsonl`（对话流水，daemon 自动记）、`<openid>.notes.md`（访客 worker 维护）、`persona.md`（可选人设补充）、`state.json`（限流内部状态） |
 | `outbox/` | agent 写出的回复，文件名与 inbox 对应，格式见下 |
+| `actions/` | owner agent 的 API 动作文件，执行结果写 `done/<文件名>.result.json`，格式见下 |
 | `proactive/` | 待发的主动消息文件，格式见下 |
 | `events/events.jsonl` | 交互与生命周期事件日志（每行一个 JSON） |
 | `done/` | 已处理归档：消息文件、`.reply.json`、`.proactive.json`、结果标记（`.SENT` / `.PARTIAL` / `.EXPIRED` / `.INVALID` / `.ORPHAN` / `.FAILED`，标记文件内是含时间与原因的 JSON） |
@@ -94,7 +97,7 @@ QQ 用户 ──消息──▶ QQ 开放平台 ──WebSocket 网关──▶ 
 | `logs/watchdog.log` | 看门狗重启记录 |
 | `logs/supervisor.log`、`logs/daemon-stdout.log` | run.sh 监督日志与 daemon 标准输出 |
 | `state/` | WebSocket 会话恢复状态、回复计数与序号账本（reply_counts.json）、发送进度（send_progress.json）、召回记账（wakeup_usage.json / last_seen.json）、绑定候选（pending.json）、心跳（heartbeat.json）、附件缓存 |
-| `tests/` | 离线测试套件（stub API）：`tests/test_bridge_offline.py`，33 项 |
+| `tests/` | 离线测试套件（stub API）：`tests/test_bridge_offline.py` 33 项 + `tests/test_framework_offline.py` 31 项 |
 | `.venv/` | Python 虚拟环境（qqbot-agent-sdk 1.2.2） |
 
 ### inbox 记录结构
@@ -140,6 +143,21 @@ media 的 path 必须是已存在的本地文件，否则整份 payload 按 INVA
 命令行快捷方式：`push.py "文本"`（默认收件人是 `allow_openids` 第一
 位；`--group` 发群；`--wakeup` 走互动召回）。
 
+### actions 格式（owner agent 驱动 API，任意文件名）
+
+```json
+{"action": "send_group", "args": {"group_openid": "...", "content": "..."}}
+{"action": "recall_c2c", "args": {"openid": "...", "message_id": "..."}}
+{"action": "get_bot_info", "args": {}}
+```
+
+daemon 按 `daemon.py` 的 `ACTION_NAMES` 白名单执行 `qqapi.py` 的同名
+方法（发送/撤回/文件上传/私信/频道与成员与角色/公告/精华/日程/表态/
+论坛/音频等），结果写 `done/<文件名>.result.json`：
+`{"action": ..., "ok": true, "result": ...}` 或
+`{"action": ..., "ok": false, "error": "..."}`。动作文件执行后删除。
+参数签名以 `qqapi.py` 为准。
+
 ## 凭据与配置
 
 凭据在桥目录的 `credentials.env`（格式见 `credentials.env.example`，
@@ -168,6 +186,30 @@ QQBOT_APP_SECRET=<你的 AppSecret>
 | `group_full_messages` | false | 是否接收群全量消息 |
 | `heartbeat_seconds` | 20 | heartbeat.json 刷新间隔 |
 | `liveness_timeout_seconds` | 300 | 网关静默多久后硬退出等监督层拉起 |
+| `access_mode` | private | `private` = 仅白名单；`public` = 非白名单私聊发信人成为访客 |
+| `block_openids` | `[]` | 任何模式下都直接丢弃的发信人 |
+| `guest_daily_limit` | 30 | 每位访客每天可发条数（0 = 不限）；超限不入箱，daemon 直接回一句提示（每人每天一次） |
+| `guest_min_interval_seconds` | 3 | 同一访客两条消息的最小间隔 |
+| `guest_welcome_enabled` | false | public 模式下新好友加机器人时发一条欢迎主动消息 |
+| `guest_welcome_text` | （内置一句） | 欢迎语文本 |
+| `actions_enabled` | true | 是否处理 `actions/` 动作文件 |
+| `admin_port` | 0 | 本地管理接口端口（127.0.0.1，令牌 `state/admin.token`）；0 = 关闭。改端口需重启 daemon |
+
+配置支持热加载：daemon 每 5 秒检查 `config.json` 的修改时间，变了就
+先校验（`sanitize_config`：未知键、类型错误、`access_mode` 非法值都
+整份拒绝）再整体换入，失败保留旧配置并记日志。管理接口
+`PUT /api/config` 走同一套校验。凭据不在热加载范围。
+
+管理接口（`admin_port` > 0 时）：
+
+| 路由 | 说明 |
+|---|---|
+| `GET /api/status` | pid、运行时长、access_mode、白名单人数、inbox/guest_inbox 待处理数、访客数、网关是否 READY |
+| `GET /api/config` | 当前生效配置 |
+| `PUT /api/config` | 提交补丁 JSON，校验后落盘，热加载随即生效 |
+| `GET /api/guests` | 访客列表（openid、首次/最近出现、今日条数） |
+| `GET /api/events?n=50` | events.jsonl 最近 n 条 |
+| `POST /api/push` | `{"scene","target","content"}` 排一条主动消息 |
 
 平台侧确认：应用需开通「群与 C2C 消息」相关事件订阅
 （`C2C_MESSAGE_CREATE` / `GROUP_AT_MESSAGE_CREATE`，intent

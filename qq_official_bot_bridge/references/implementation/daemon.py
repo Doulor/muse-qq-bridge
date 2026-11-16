@@ -108,6 +108,10 @@ from qqbot_agent_sdk.dto import (
 )
 from qqbot_agent_sdk.media_loader import MediaUploader
 
+from guests import GuestStore
+from qqapi import QQApi
+from admin import AdminFacade, AdminServer, ensure_token
+
 BASE = Path(os.environ.get("QQ_BRIDGE_HOME", Path(__file__).resolve().parent))
 INBOX = BASE / "inbox"
 OUTBOX = BASE / "outbox"
@@ -116,6 +120,9 @@ EVENTS = BASE / "events"
 DONE = BASE / "done"
 LOGS = BASE / "logs"
 STATE = BASE / "state"
+GUEST_INBOX = BASE / "guest_inbox"
+ACTIONS = BASE / "actions"
+GUESTS_DIR = BASE / "guests"
 CREDENTIALS_FILE = Path(
     os.environ.get("QQ_BRIDGE_CREDENTIALS", str(BASE / "credentials.env"))
 )
@@ -143,6 +150,32 @@ LIFECYCLE_EVENT_TYPES = frozenset({
     "GROUP_MSG_RECEIVE",
     "C2C_MSG_REJECT",
     "C2C_MSG_RECEIVE",
+    # Guild lifecycle + membership (recorded to events.jsonl; delivery
+    # depends on the intents the gateway session subscribed to).
+    "GUILD_CREATE",
+    "GUILD_UPDATE",
+    "GUILD_DELETE",
+    "CHANNEL_CREATE",
+    "CHANNEL_UPDATE",
+    "CHANNEL_DELETE",
+    "GUILD_MEMBER_ADD",
+    "GUILD_MEMBER_UPDATE",
+    "GUILD_MEMBER_REMOVE",
+    # Message audit results for guild sends.
+    "MESSAGE_AUDIT_PASS",
+    "MESSAGE_AUDIT_REJECT",
+    # Audio / live channels.
+    "AUDIO_OR_LIVE_CHANNEL_MEMBER_ENTER",
+    "AUDIO_OR_LIVE_CHANNEL_MEMBER_EXIT",
+    # Forum (帖子) channels.
+    "FORUM_THREAD_CREATE",
+    "FORUM_THREAD_UPDATE",
+    "FORUM_THREAD_DELETE",
+    "FORUM_POST_CREATE",
+    "FORUM_POST_DELETE",
+    "FORUM_REPLY_CREATE",
+    "FORUM_REPLY_DELETE",
+    "FORUM_PUBLISH_AUDIT_RESULT",
 })
 
 UNBOUND_TEXT = (
@@ -177,6 +210,26 @@ DEFAULT_CONFIG: dict = {
     # Also receive group messages that do not @ the bot (needs the
     # platform-side group full-message permission).
     "group_full_messages": False,
+    # ── framework v3 ──────────────────────────────────────────────────
+    # Access tiers for C2C: "private" = owner allowlist only (default);
+    # "public" = non-allowlist senders become rate-limited guests whose
+    # messages land in guest_inbox/ for a restricted worker.
+    "access_mode": "private",
+    # Always dropped, in every mode, before any other check.
+    "block_openids": [],
+    # Guest budget: messages per guest per day (0 = unlimited) and the
+    # minimum seconds between two guest messages.
+    "guest_daily_limit": 30,
+    "guest_min_interval_seconds": 3,
+    # In public mode, greet a brand-new friend with one proactive
+    # message (best effort) when FRIEND_ADD arrives.
+    "guest_welcome_enabled": False,
+    "guest_welcome_text": "你好，我是 Ruben_muse，可以陪你聊天。直接发消息给我就行。",
+    # Process actions/ files: agent-driven API calls (see qqapi.py).
+    "actions_enabled": True,
+    # Localhost admin API port (127.0.0.1, token in state/admin.token);
+    # 0 disables it.
+    "admin_port": 0,
     "heartbeat_seconds": 20,
     # Exit hard when the gateway has been silent this long (seconds).
     "liveness_timeout_seconds": 300,
@@ -193,6 +246,52 @@ def load_config() -> dict:
         except (json.JSONDecodeError, OSError):
             logger.exception("config.json unreadable; using defaults")
     return cfg
+
+
+_LIST_KEYS = ("allow_openids", "allow_group_member_openids", "block_openids")
+_BOOL_KEYS = ("typing", "group_full_messages", "guest_welcome_enabled", "actions_enabled")
+_INT_KEYS = (
+    "reply_window_seconds", "max_replies_per_message", "proactive_retries",
+    "proactive_retry_delay_seconds", "guest_daily_limit",
+    "guest_min_interval_seconds", "heartbeat_seconds",
+    "liveness_timeout_seconds", "admin_port",
+)
+_STR_KEYS = ("access_mode", "guest_welcome_text")
+
+
+def sanitize_config(raw: dict, base: Optional[dict] = None) -> tuple:
+    """Merge a (possibly partial) config patch over ``base``.
+
+    Returns (config, errors).  Unknown keys are rejected so a typo in
+    the admin API or the Space panel cannot silently create a dead key.
+    """
+    cfg = dict(base if base is not None else DEFAULT_CONFIG)
+    errors = []
+    for key, value in raw.items():
+        if key not in DEFAULT_CONFIG:
+            errors.append(f"unknown config key: {key}")
+            continue
+        if key in _LIST_KEYS:
+            if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+                errors.append(f"{key} must be a list of strings")
+                continue
+        elif key in _BOOL_KEYS:
+            if not isinstance(value, bool):
+                errors.append(f"{key} must be a boolean")
+                continue
+        elif key in _INT_KEYS:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                errors.append(f"{key} must be a number")
+                continue
+        elif key in _STR_KEYS:
+            if not isinstance(value, str):
+                errors.append(f"{key} must be a string")
+                continue
+            if key == "access_mode" and value not in ("private", "public"):
+                errors.append("access_mode must be 'private' or 'public'")
+                continue
+        cfg[key] = value
+    return cfg, errors
 
 
 def load_credentials() -> Optional[tuple]:
@@ -457,6 +556,13 @@ class Bridge:
             STATE, int(config["max_replies_per_message"])
         )
         self.wakeup = WakeupBook(STATE)
+        self.guests = GuestStore(GUESTS_DIR)
+        self.qq = QQApi(api)
+        self.started_at = time.time()
+        try:
+            self._cfg_mtime = CONFIG_FILE.stat().st_mtime
+        except OSError:
+            self._cfg_mtime = 0.0
         self._progress_file = STATE / "send_progress.json"
         # Media upload + voice transcription helpers (SDK-provided).
         self.uploader: Optional[MediaUploader] = None
@@ -475,6 +581,32 @@ class Bridge:
                 downloader,
                 log_tag="QQBridge",
             )
+
+    def reload_config(self) -> bool:
+        """Hot-reload config.json when its mtime changed.
+
+        Returns True when a new config was swapped in.  A malformed or
+        invalid file keeps the running config and is logged.
+        """
+        try:
+            mtime = CONFIG_FILE.stat().st_mtime
+        except OSError:
+            return False
+        if mtime == self._cfg_mtime:
+            return False
+        self._cfg_mtime = mtime
+        fresh = load_config()
+        _, errors = sanitize_config(fresh, DEFAULT_CONFIG)
+        if errors:
+            logger.error("config reload rejected: %s", "; ".join(errors))
+            return False
+        self.cfg = fresh
+        self.ledger._max = int(fresh["max_replies_per_message"])
+        logger.info(
+            "config hot-reloaded (access_mode=%s, allow=%d)",
+            fresh.get("access_mode"), len(fresh.get("allow_openids", [])),
+        )
+        return True
 
     # -- gateway callbacks ---------------------------------------------
 
@@ -554,6 +686,22 @@ class Bridge:
             "received_at": datetime.now(timezone.utc).isoformat(),
         })
         logger.info("lifecycle event logged: %s", event_type)
+        if (
+            event_type == "FRIEND_ADD"
+            and self.cfg.get("access_mode") == "public"
+            and self.cfg.get("guest_welcome_enabled")
+        ):
+            openid = str(raw.get("openid") or "")
+            if openid:
+                _write_json_atomic(
+                    PROACTIVE / f"welcome-{openid[:12]}.json",
+                    {
+                        "scene": "c2c",
+                        "target": openid,
+                        "content": str(self.cfg.get("guest_welcome_text", "")),
+                    },
+                )
+                logger.info("queued welcome message for new friend %s...", openid[:8])
 
     # -- inbound ---------------------------------------------------------
 
@@ -634,23 +782,44 @@ class Bridge:
             logger.warning("dropping message with unsafe id %r", msg_id)
             return
 
-        # Owner allowlist, enforced here so strangers never wake the agent.
+        # Access tiers, enforced here so strangers never wake the
+        # owner worker.  C2C order: blocklist, binding mode (empty
+        # allowlist), owner allowlist, then — in public mode only —
+        # rate-limited guests.
+        tier = "owner"
         if event.chat_scope == "c2c":
             self.wakeup.touch(sender)
+            if sender in [str(x) for x in self.cfg.get("block_openids", [])]:
+                logger.info("c2c sender %s... is blocked; dropped", sender[:8])
+                return
             allow = [str(x) for x in self.cfg.get("allow_openids", [])]
             if not allow:
                 await self._handle_unbound(sender, msg_id, content)
                 return
             if sender not in allow:
-                logger.info("c2c sender %s... not in allowlist; dropped", sender[:8])
-                return
+                if str(self.cfg.get("access_mode", "private")) != "public":
+                    logger.info("c2c sender %s... not in allowlist; dropped", sender[:8])
+                    return
+                tier = "guest"
+                ok, reason = self.guests.check_and_count(
+                    sender,
+                    int(self.cfg.get("guest_daily_limit", 30)),
+                    float(self.cfg.get("guest_min_interval_seconds", 3)),
+                )
+                if not ok:
+                    logger.info("guest %s... rate limited (%s)", sender[:8], reason)
+                    if reason == "daily_limit" and self.guests.should_notice_limit(sender):
+                        self.guests.note_limit_notice(sender)
+                        asyncio.create_task(self._send_limit_notice(sender, msg_id))
+                    return
         elif event.chat_scope == "group":
             allow_g = [str(x) for x in self.cfg.get("allow_group_member_openids", [])]
             if allow_g and sender not in allow_g:
                 logger.info("group sender %s... not in allowlist; dropped", sender[:8])
                 return
 
-        target = INBOX / f"{msg_id}.json"
+        home_dir = GUEST_INBOX if tier == "guest" else INBOX
+        target = home_dir / f"{msg_id}.json"
         if target.exists() or (DONE / f"{msg_id}.json").exists():
             return  # duplicate delivery
         record: dict = {
@@ -666,6 +835,7 @@ class Bridge:
             "attachments": attachments,
             "attachment_only": not content and bool(attachments),
             "received_at": datetime.now(timezone.utc).isoformat(),
+            "tier": tier,
         }
         if event_type == "GROUP_MESSAGE_CREATE":
             record["full_message"] = True
@@ -690,11 +860,16 @@ class Bridge:
                 if asr_note:
                     record["asr_note"] = asr_note
                 break
-        tmp = INBOX / f".{msg_id}.tmp"
+        tmp = home_dir / f".{msg_id}.tmp"
         tmp.write_text(
             json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         tmp.rename(target)
+        if tier == "guest":
+            self.guests.mark_message(msg_id, sender)
+            self.guests.append_history(
+                sender, "user", content or "[附件消息]", msg_id
+            )
         logger.info(
             "inbox: %s message %s from %s (%d chars, %d attachment(s))",
             record["scene"],
@@ -705,6 +880,18 @@ class Bridge:
         )
         if event.chat_scope == "c2c" and self.cfg["typing"]:
             asyncio.create_task(self._send_typing(sender, msg_id))
+
+    async def _send_limit_notice(self, user_openid: str, msg_id: str) -> None:
+        """Best-effort 'daily budget spent' reply for a guest."""
+        try:
+            await self.api.send_text(
+                "c2c",
+                user_openid,
+                "今天的聊天额度用完啦，明天再来找我玩。",
+                reply_to=msg_id,
+            )
+        except Exception:
+            logger.debug("limit notice failed for %s...", user_openid[:8], exc_info=True)
 
     async def _send_typing(self, user_openid: str, msg_id: str) -> None:
         """Best-effort typing indicator for C2C conversations."""
@@ -905,6 +1092,10 @@ class Bridge:
             return  # still being written; retry on the next poll
         inbox_file = INBOX / f"{msg_id}.json"
         if not inbox_file.exists():
+            guest_file = GUEST_INBOX / f"{msg_id}.json"
+            if guest_file.exists():
+                inbox_file = guest_file
+        if not inbox_file.exists():
             logger.warning(
                 "outbox %s has no matching inbox record; archiving as orphan",
                 msg_id,
@@ -993,11 +1184,22 @@ class Bridge:
             sent_parts += 1
             self._set_progress(f"outbox:{msg_id}", {"sent_parts": sent_parts})
         logger.info("sent reply for %s (%d part(s))", msg_id, len(parts))
+        if record.get("tier") == "guest":
+            for part in parts:
+                text = part.get("text") or ""
+                if text:
+                    self.guests.append_history(
+                        str(record.get("user_openid")), "assistant", text, msg_id
+                    )
         self._archive(msg_id, "SENT")
 
     def _archive(self, msg_id: str, marker: str, note: str = "") -> None:
         DONE.mkdir(parents=True, exist_ok=True)
         inbox_file = INBOX / f"{msg_id}.json"
+        if not inbox_file.exists():
+            guest_file = GUEST_INBOX / f"{msg_id}.json"
+            if guest_file.exists():
+                inbox_file = guest_file
         outbox_file = OUTBOX / f"{msg_id}.json"
         if inbox_file.exists():
             inbox_file.rename(DONE / f"{msg_id}.json")
@@ -1014,6 +1216,74 @@ class Bridge:
         )
         self._set_progress(f"outbox:{msg_id}", None)
 
+
+    # -- actions (agent-driven API calls) --------------------------------
+    # The agent drops {"action": <name>, "args": {...}} files into
+    # actions/; the daemon executes the matching qqapi method and
+    # writes done/<name>.result.json with {"ok": ..., "result"/"error"}.
+    # Only the explicit whitelist below is reachable — no attribute
+    # fishing on the client object.
+
+    ACTION_NAMES = frozenset({
+        "get_bot_info", "list_my_guilds",
+        "send_c2c", "send_group", "send_guild", "send_dm",
+        "send_typing", "ack_interaction",
+        "recall_c2c", "recall_group", "recall_guild", "recall_dm",
+        "upload_c2c_file", "upload_group_file", "create_dm",
+        "get_guild", "list_channels", "get_channel", "create_channel",
+        "modify_channel", "delete_channel", "get_channel_online_nums",
+        "list_guild_members", "get_guild_member", "delete_guild_member",
+        "mute_all", "mute_member",
+        "list_roles", "create_role", "modify_role", "delete_role",
+        "add_member_role", "remove_member_role",
+        "get_channel_member_permissions", "modify_channel_member_permissions",
+        "get_channel_role_permissions", "modify_channel_role_permissions",
+        "create_announce", "delete_announce",
+        "put_pin", "delete_pin", "list_pins",
+        "create_schedule", "list_schedules", "get_schedule",
+        "modify_schedule", "delete_schedule",
+        "put_reaction", "delete_reaction", "list_reaction_users",
+        "list_threads", "get_thread", "put_thread", "delete_thread",
+        "audio_control", "put_mic", "delete_mic",
+        "get_guild_message_setting",
+    })
+
+    async def actions_loop(self) -> None:
+        while True:
+            try:
+                if self.cfg.get("actions_enabled", True):
+                    for path in sorted(ACTIONS.glob("*.json")):
+                        if not path.name.startswith("."):
+                            await self._handle_action_file(path)
+            except Exception:
+                logger.exception("actions scan failed")
+            await asyncio.sleep(2.0)
+
+    async def _handle_action_file(self, path: Path) -> None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return  # still being written; retry next poll
+        name = str(payload.get("action") or "")
+        args = payload.get("args") or {}
+        result: dict = {"action": name, "at": datetime.now(timezone.utc).isoformat()}
+        if name not in self.ACTION_NAMES or not isinstance(args, dict):
+            result.update({"ok": False, "error": f"unknown or invalid action: {name!r}"})
+        else:
+            try:
+                value = await getattr(self.qq, name)(**args)
+                result.update({"ok": True, "result": value})
+            except Exception as exc:
+                result.update({"ok": False, "error": str(exc)[:500]})
+        DONE.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(DONE / f"{path.stem}.result.json", result)
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        logger.info(
+            "action %s -> %s", name, "ok" if result.get("ok") else result.get("error")
+        )
 
     # -- proactive messages ----------------------------------------------
 
@@ -1157,10 +1427,15 @@ class Bridge:
         while True:
             try:
                 pending = sum(1 for p in INBOX.glob("*.json") if not p.name.startswith("."))
+                guest_pending = sum(1 for p in GUEST_INBOX.glob("*.json") if not p.name.startswith("."))
                 _write_json_atomic(STATE / "heartbeat.json", {
                     "ts": time.time(),
                     "pid": os.getpid(),
                     "inbox_pending": pending,
+                    "guest_inbox_pending": guest_pending,
+                    "access_mode": self.cfg.get("access_mode", "private"),
+                    "guests": self.guests.guest_count(),
+                    "uptime_s": round(time.time() - self.started_at),
                 })
             except Exception:
                 logger.exception("heartbeat write failed")
@@ -1168,7 +1443,8 @@ class Bridge:
 
 
 async def main() -> int:
-    for directory in (INBOX, OUTBOX, PROACTIVE, EVENTS, DONE, LOGS, STATE):
+    for directory in (INBOX, OUTBOX, PROACTIVE, EVENTS, DONE, LOGS, STATE,
+                      GUEST_INBOX, ACTIONS, GUESTS_DIR):
         directory.mkdir(parents=True, exist_ok=True)
     setup_logging()
     config = load_config()
@@ -1271,10 +1547,79 @@ async def main() -> int:
                 )
                 os._exit(4)
 
+    async def config_loop() -> None:
+        while True:
+            await asyncio.sleep(5)
+            try:
+                bridge.reload_config()
+            except Exception:
+                logger.exception("config reload check failed")
+
+    admin_server = None
+    admin_port = int(config.get("admin_port", 0))
+    if admin_port > 0:
+        def _events_tail(n: int) -> list:
+            events_file = EVENTS / "events.jsonl"
+            if not events_file.is_file():
+                return []
+            lines = events_file.read_text(encoding="utf-8").splitlines()[-n:]
+            out = []
+            for line in lines:
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    pass
+            return out
+
+        def _put_config(patch: dict) -> tuple:
+            merged, errors = sanitize_config(patch, bridge.cfg)
+            if errors:
+                return False, "; ".join(errors)
+            persisted = {k: merged[k] for k in DEFAULT_CONFIG}
+            _write_json_atomic(CONFIG_FILE, persisted)
+            return True, "saved; hot reload applies it within seconds"
+
+        def _queue_push(payload: dict) -> tuple:
+            scene = str(payload.get("scene") or "")
+            target = str(payload.get("target") or "")
+            content = str(payload.get("content") or "")
+            if scene not in ("c2c", "group") or not target or not content:
+                return False, "need scene (c2c|group), target and content"
+            name = f"admin-{int(time.time() * 1000)}.json"
+            _write_json_atomic(
+                PROACTIVE / name,
+                {"scene": scene, "target": target, "content": content},
+            )
+            return True, f"queued as {name}"
+
+        facade = AdminFacade(
+            status=lambda: {
+                "pid": os.getpid(),
+                "uptime_s": round(time.time() - bridge.started_at),
+                "access_mode": bridge.cfg.get("access_mode", "private"),
+                "allow_count": len(bridge.cfg.get("allow_openids", [])),
+                "inbox_pending": sum(1 for p in INBOX.glob("*.json")),
+                "guest_inbox_pending": sum(1 for p in GUEST_INBOX.glob("*.json")),
+                "guests": bridge.guests.guest_count(),
+                "gateway_ready": bool(bridge.bot_openids),
+            },
+            get_config=lambda: dict(bridge.cfg),
+            put_config=_put_config,
+            guests=bridge.guests.list_guests,
+            events_tail=_events_tail,
+            queue_push=_queue_push,
+        )
+        token = ensure_token(STATE)
+        admin_server = AdminServer(admin_port, token, facade)
+        admin_server.start()
+        logger.info("admin API listening on 127.0.0.1:%d", admin_port)
+
     watchers = [
         asyncio.create_task(bridge.outbox_loop()),
         asyncio.create_task(bridge.proactive_loop()),
         asyncio.create_task(bridge.heartbeat_loop()),
+        asyncio.create_task(bridge.actions_loop()),
+        asyncio.create_task(config_loop()),
         asyncio.create_task(liveness_loop()),
     ]
     logger.info("qq-bridge running; watching %s and %s", OUTBOX, PROACTIVE)
