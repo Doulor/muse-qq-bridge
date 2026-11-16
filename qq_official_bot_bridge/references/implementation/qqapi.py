@@ -33,7 +33,17 @@ class QQApi:
         json_body: Optional[dict] = None,
         params: Optional[dict] = None,
     ) -> Any:
-        return await self.c.request(method, path, json_body=json_body, params=params)
+        # SDK request() is (method, path, body) positional with no
+        # params support — query parameters are baked into the path.
+        if params:
+            from urllib.parse import urlencode
+
+            qs = urlencode(
+                {k: v for k, v in params.items() if v not in (None, "")}
+            )
+            if qs:
+                path = f"{path}?{qs}"
+        return await self.c.request(method, path, json_body)
 
     # -- identity ---------------------------------------------------------
 

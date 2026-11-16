@@ -61,7 +61,7 @@ class StubAPI:
     async def send_typing(self, chat_id, msg_id, **kw):
         self.typing.append((chat_id, msg_id))
 
-    async def request(self, method, path, json_body=None, params=None):
+    async def request(self, method, path, body=None, **kw):
         self.requests.append((method, path))
         return {"ok": True, "path": path}
 

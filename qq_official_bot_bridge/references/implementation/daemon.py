@@ -889,6 +889,7 @@ class Bridge:
                 user_openid,
                 "今天的聊天额度用完啦，明天再来找我玩。",
                 reply_to=msg_id,
+                markdown=False,
             )
         except Exception:
             logger.debug("limit notice failed for %s...", user_openid[:8], exc_info=True)
