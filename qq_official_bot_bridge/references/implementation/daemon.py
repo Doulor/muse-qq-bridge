@@ -225,6 +225,12 @@ DEFAULT_CONFIG: dict = {
     # message (best effort) when FRIEND_ADD arrives.
     "guest_welcome_enabled": False,
     "guest_welcome_text": "你好，我是 Ruben_muse，可以陪你聊天。直接发消息给我就行。",
+    # Text of the once-a-day over-limit notice for guests.
+    "guest_limit_text": "今天的聊天额度用完啦，明天再来找我玩。",
+    # Master switch for the proactive/ directory (weather, reminders).
+    "proactive_enabled": True,
+    # Transcribe inbound voice attachments (platform ASR / STT pipeline).
+    "voice_asr": True,
     # Process actions/ files: agent-driven API calls (see qqapi.py).
     "actions_enabled": True,
     # Localhost admin API port (127.0.0.1, token in state/admin.token);
@@ -249,14 +255,15 @@ def load_config() -> dict:
 
 
 _LIST_KEYS = ("allow_openids", "allow_group_member_openids", "block_openids")
-_BOOL_KEYS = ("typing", "group_full_messages", "guest_welcome_enabled", "actions_enabled")
+_BOOL_KEYS = ("typing", "group_full_messages", "guest_welcome_enabled", "actions_enabled",
+              "proactive_enabled", "voice_asr")
 _INT_KEYS = (
     "reply_window_seconds", "max_replies_per_message", "proactive_retries",
     "proactive_retry_delay_seconds", "guest_daily_limit",
     "guest_min_interval_seconds", "heartbeat_seconds",
     "liveness_timeout_seconds", "admin_port",
 )
-_STR_KEYS = ("access_mode", "guest_welcome_text")
+_STR_KEYS = ("access_mode", "guest_welcome_text", "guest_limit_text")
 
 
 def sanitize_config(raw: dict, base: Optional[dict] = None) -> tuple:
@@ -855,6 +862,10 @@ class Bridge:
         # Voice: transcribe the first voice attachment, if any.
         for att in event.attachments:
             if is_voice_content_type(att.content_type or "", att.filename or ""):
+                if not self.cfg.get("voice_asr", True):
+                    record["asr_text"] = None
+                    record["asr_note"] = "voice transcription disabled by config"
+                    break
                 asr_text, asr_note = await self._transcribe_voice(att)
                 record["asr_text"] = asr_text
                 if asr_note:
@@ -887,7 +898,7 @@ class Bridge:
             await self.api.send_text(
                 "c2c",
                 user_openid,
-                "今天的聊天额度用完啦，明天再来找我玩。",
+                str(self.cfg.get("guest_limit_text") or "今天的聊天额度用完啦，明天再来找我玩。"),
                 reply_to=msg_id,
                 markdown=False,
             )
@@ -1291,8 +1302,9 @@ class Bridge:
     async def proactive_loop(self) -> None:
         while True:
             try:
-                for path in sorted(p for p in PROACTIVE.glob("*.json") if not p.name.startswith(".")):
-                    await self._handle_proactive_file(path)
+                if self.cfg.get("proactive_enabled", True):
+                    for path in sorted(p for p in PROACTIVE.glob("*.json") if not p.name.startswith(".")):
+                        await self._handle_proactive_file(path)
             except Exception:
                 logger.exception("proactive scan failed")
             await asyncio.sleep(OUTBOX_POLL_SECONDS)
