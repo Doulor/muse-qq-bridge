@@ -394,3 +394,226 @@ class QQApi:
     async def get_guild_message_setting(self, guild_id: str) -> Any:
         """GET /guilds/{id}/message_setting — guild message push settings."""
         return await self._req("GET", f"/guilds/{guild_id}/message_setting")
+
+    async def get_guild_api_permission(self, guild_id: str) -> Any:
+        """GET /guilds/{id}/api_permission — APIs the bot may use in
+        this guild, with per-endpoint auth status."""
+        return await self._req("GET", f"/guilds/{guild_id}/api_permission")
+
+    async def demand_guild_api_permission(self, guild_id: str, path: str,
+                                          method: str) -> Any:
+        """POST /guilds/{id}/api_permission/demand — post an auth link
+        into the guild asking the owner to grant one endpoint
+        (rate-limited per guild per day)."""
+        return await self._req(
+            "POST", f"/guilds/{guild_id}/api_permission/demand",
+            json_body={"path": path, "method": method},
+        )
+
+    # -- C2C custom menu & command panels -------------------------------------------------------------
+
+    async def get_menu(self) -> Any:
+        """GET /v2/menu — the global C2C custom menu (one per bot,
+        shown at the bottom of every C2C chat window)."""
+        return await self._req("GET", "/v2/menu")
+
+    async def put_menu(self, menu: dict) -> Any:
+        """PUT /v2/menu — replace the whole custom menu.  Body shape
+        per docs: {"menu": [...]} with item types switch /
+        send_message / link / menu; ≤10 top-level, ≤5 second-level."""
+        return await self._req("PUT", "/v2/menu", json_body=menu)
+
+    async def list_panels(self, scope: str, page: int = 1, page_size: int = 20) -> Any:
+        """GET /v2/panels?scope=c2c|group|channel|dm — command panels."""
+        return await self._req(
+            "GET", "/v2/panels",
+            params={"scope": scope, "page": page, "page_size": page_size},
+        )
+
+    async def create_panel(self, panel: dict) -> Any:
+        """POST /v2/panels — create a command panel (body per docs;
+        target_type all/specific, specific links ≤20 openids at once,
+        channel/dm panels can only be all)."""
+        return await self._req("POST", "/v2/panels", json_body=panel)
+
+    async def get_panel(self, panel_id: str) -> Any:
+        return await self._req("GET", f"/v2/panels/{panel_id}")
+
+    async def put_panel(self, panel_id: str, panel: dict) -> Any:
+        """PUT /v2/panels/{id} — replace panel content (scope and
+        linked targets are not changed by this call)."""
+        return await self._req("PUT", f"/v2/panels/{panel_id}", json_body=panel)
+
+    async def delete_panel(self, panel_id: str) -> Any:
+        return await self._req("DELETE", f"/v2/panels/{panel_id}")
+
+    async def put_panel_target(self, panel_id: str, body: dict) -> Any:
+        """PUT /v2/panels/{id}/target — add/remove a specific panel's
+        linked users/groups (op=add/del).  NOTE: this path is attested
+        by the docs' request schema but was not verified verbatim
+        against the live wiki; expect a possible 404 until confirmed."""
+        return await self._req("PUT", f"/v2/panels/{panel_id}/target", json_body=body)
+
+    # -- chunked upload (large files) ---------------------------------------------------------------------
+
+    async def upload_prepare_c2c(self, openid: str, body: dict) -> Any:
+        """POST /v2/users/{openid}/files/upload_prepare — start a
+        chunked upload; body carries file metadata per docs."""
+        return await self._req(
+            "POST", f"/v2/users/{openid}/files/upload_prepare", json_body=body
+        )
+
+    async def upload_part_finish_c2c(self, openid: str, body: dict) -> Any:
+        """POST /v2/users/{openid}/files/upload_part_finish — finish
+        one uploaded chunk; the final chunk yields the file_info."""
+        return await self._req(
+            "POST", f"/v2/users/{openid}/files/upload_part_finish", json_body=body
+        )
+
+    async def upload_prepare_group(self, group_openid: str, body: dict) -> Any:
+        return await self._req(
+            "POST", f"/v2/groups/{group_openid}/files/upload_prepare", json_body=body
+        )
+
+    async def upload_part_finish_group(self, group_openid: str, body: dict) -> Any:
+        return await self._req(
+            "POST", f"/v2/groups/{group_openid}/files/upload_part_finish", json_body=body
+        )
+
+    # -- C2C streaming messages ------------------------------------------------------------------------------
+
+    async def stream_c2c_message(self, openid: str, body: dict) -> Any:
+        """POST /v2/users/{openid}/messages with the streaming variant:
+        the body carries a stream descriptor (input_state 1=generating
+        / 10=done, an increasing index, content_type text|markdown);
+        the first chunk returns the stream message id, later chunks
+        reference it.  Body is passed through verbatim so callers
+        follow the current docs exactly.  C2C only."""
+        return await self._req("POST", f"/v2/users/{openid}/messages", json_body=body)
+
+    # -- group management (permission-gated: whitelist / bot must be group admin) ----------------------------
+
+    async def get_group_info(self, group_openid: str) -> Any:
+        """GET /v2/groups/{gid}/info. Whitelist-gated (11253 without)."""
+        return await self._req("GET", f"/v2/groups/{group_openid}/info")
+
+    async def get_group_bot_state(self, group_openid: str) -> Any:
+        """GET /v2/groups/{gid}/bot_state — the bot's own member_openid,
+        role, proactive permission and receive setting in this group."""
+        return await self._req("GET", f"/v2/groups/{group_openid}/bot_state")
+
+    async def list_group_join_requests(self, group_openid: str, cursor: str = "",
+                                       limit: int = 50) -> Any:
+        """GET /v2/groups/{gid}/join_request_list. Bot must be a group
+        admin."""
+        params: dict = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        return await self._req(
+            "GET", f"/v2/groups/{group_openid}/join_request_list", params=params
+        )
+
+    async def approve_group_join_request(self, group_openid: str,
+                                         member_openid: str, body: dict) -> Any:
+        """POST /v2/groups/{gid}/approval_join_request/{member_openid}
+        — body: {"op": "approve"|"decline", optional join_request_id,
+        decline reason, blacklist flag}."""
+        return await self._req(
+            "POST",
+            f"/v2/groups/{group_openid}/approval_join_request/{member_openid}",
+            json_body=body,
+        )
+
+    async def get_group_restrict_setting(self, group_openid: str) -> Any:
+        """GET /v2/groups/{gid}/restrict_chat_setting — the global rule
+        is read-only; the response also lists timed rules and muted
+        members."""
+        return await self._req(
+            "GET", f"/v2/groups/{group_openid}/restrict_chat_setting"
+        )
+
+    async def set_group_member_mutes(self, group_openid: str, members: list) -> Any:
+        """POST /v2/groups/{gid}/restrict_chat_setting — members:
+        [{op: add|update|del, member_openid, mute_expire_at}], ≤20 per
+        call, ≤30 days, regular members only.  There is NO endpoint
+        for the all-member mute rule."""
+        return await self._req(
+            "POST", f"/v2/groups/{group_openid}/restrict_chat_setting",
+            json_body={"members": members},
+        )
+
+    async def list_join_strategies(self) -> Any:
+        """GET /v2/groups/join_approval_strategy — bot-level automatic
+        join-approval strategies."""
+        return await self._req("GET", "/v2/groups/join_approval_strategy")
+
+    async def create_join_strategy(self, body: dict) -> Any:
+        """POST /v2/groups/join_approval_strategy — body per docs
+        (group_openids or group_ids ≤100, ≤20 strategies per bot)."""
+        return await self._req(
+            "POST", "/v2/groups/join_approval_strategy", json_body=body
+        )
+
+    async def modify_join_strategy(self, strategy_id: str, body: dict) -> Any:
+        return await self._req(
+            "PATCH", f"/v2/groups/join_approval_strategy/{strategy_id}",
+            json_body=body,
+        )
+
+    async def delete_join_strategy(self, strategy_id: str) -> Any:
+        return await self._req(
+            "DELETE", f"/v2/groups/join_approval_strategy/{strategy_id}"
+        )
+
+    async def execute_join_strategy(self, strategy_id: str) -> Any:
+        """POST .../execute — run the strategy now (async full scan)."""
+        return await self._req(
+            "POST", f"/v2/groups/join_approval_strategy/{strategy_id}/execute",
+            json_body={},
+        )
+
+    async def set_join_strategy_whitelist(self, strategy_id: str, body: dict) -> Any:
+        """POST .../whitelist_users — maintain the strategy's
+        auto-approve user whitelist (≤10000 per call)."""
+        return await self._req(
+            "POST",
+            f"/v2/groups/join_approval_strategy/{strategy_id}/whitelist_users",
+            json_body=body,
+        )
+
+    async def list_group_members(self, group_openid: str, cursor: str = "",
+                                 limit: int = 30) -> Any:
+        """GET /v2/groups/{gid}/members — cursor-paged, ≤30 per page.
+        Whitelist + invite-only."""
+        params: dict = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        return await self._req(
+            "GET", f"/v2/groups/{group_openid}/members", params=params
+        )
+
+    async def get_group_member(self, group_openid: str, member_openid: str) -> Any:
+        return await self._req(
+            "GET", f"/v2/groups/{group_openid}/members/{member_openid}"
+        )
+
+    async def batch_remove_group_members(self, group_openid: str, body: dict) -> Any:
+        """POST /v2/groups/{gid}/batch_remove_members — ≤20 members.
+        Whitelist + invite-only."""
+        return await self._req(
+            "POST", f"/v2/groups/{group_openid}/batch_remove_members",
+            json_body=body,
+        )
+
+    async def list_group_blacklist(self, group_openid: str, limit: int = 100) -> Any:
+        return await self._req(
+            "GET", f"/v2/groups/{group_openid}/member_blacklist",
+            params={"limit": limit},
+        )
+
+    async def update_group_blacklist(self, group_openid: str, body: dict) -> Any:
+        """POST /v2/groups/{gid}/member_blacklist — body carries
+        op=add/del and ≤20 member openids."""
+        return await self._req(
+            "POST", f"/v2/groups/{group_openid}/member_blacklist", json_body=body
+        )

@@ -47,7 +47,7 @@ qq_official_bot_bridge/
         ├── run.sh              # flock 监督循环
         ├── hooks/              # inbox 唤醒 + watchdog 保活
         ├── qr-connect/         # 扫码绑定（官方 connector）
-        ├── tests/              # 离线测试（64 项，不联网不用凭据）
+        ├── tests/              # 离线测试（71 项，不联网不用凭据）
         └── README.md           # 运维手册
 ```
 

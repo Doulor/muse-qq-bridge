@@ -176,6 +176,20 @@ LIFECYCLE_EVENT_TYPES = frozenset({
     "FORUM_REPLY_CREATE",
     "FORUM_REPLY_DELETE",
     "FORUM_PUBLISH_AUDIT_RESULT",
+    # Added from the full api-v2 event catalog (2026-11-17 reconciliation):
+    "MESSAGE_REACTION_ADD",
+    "MESSAGE_REACTION_REMOVE",
+    "MESSAGE_DELETE",
+    "DIRECT_MESSAGE_DELETE",
+    "PUBLIC_MESSAGE_DELETE",
+    "AUDIO_START",
+    "AUDIO_FINISH",
+    "AUDIO_ON_MIC",
+    "AUDIO_OFF_MIC",
+    "SUBSCRIBE_MESSAGE_STATUS",
+    "GROUP_JOIN_REQUEST",
+    "GROUP_MEMBER_ADD",
+    "GROUP_MEMBER_REMOVE",
 })
 
 UNBOUND_TEXT = (
@@ -1256,8 +1270,25 @@ class Bridge:
         "modify_schedule", "delete_schedule",
         "put_reaction", "delete_reaction", "list_reaction_users",
         "list_threads", "get_thread", "put_thread", "delete_thread",
-        "audio_control", "put_mic", "delete_mic",
+        "start_audio", "end_audio", "set_mic_on", "set_mic_off",
         "get_guild_message_setting",
+        # v3.2 additions from the api-v2 catalog reconciliation (2026-11-17):
+        "get_guild_api_permission", "demand_guild_api_permission",
+        "get_menu", "put_menu",
+        "list_panels", "create_panel", "get_panel", "put_panel",
+        "delete_panel", "put_panel_target",
+        "upload_prepare_c2c", "upload_part_finish_c2c",
+        "upload_prepare_group", "upload_part_finish_group",
+        "stream_c2c_message",
+        "get_group_info", "get_group_bot_state",
+        "list_group_join_requests", "approve_group_join_request",
+        "get_group_restrict_setting", "set_group_member_mutes",
+        "list_join_strategies", "create_join_strategy",
+        "modify_join_strategy", "delete_join_strategy",
+        "execute_join_strategy", "set_join_strategy_whitelist",
+        "list_group_members", "get_group_member",
+        "batch_remove_group_members",
+        "list_group_blacklist", "update_group_blacklist",
     })
 
     async def actions_loop(self) -> None:

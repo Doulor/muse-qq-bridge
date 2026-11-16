@@ -285,6 +285,35 @@ def t_admin_http():
         server.stop()
 
 
+async def t_actions_v32():
+    fresh_dirs()
+    bridge, api = make_bridge()
+    cases = [
+        ("m1", "get_menu", {}, ("GET", "/v2/menu")),
+        ("m2", "list_panels", {"scope": "c2c"},
+         ("GET", "/v2/panels?scope=c2c&page=1&page_size=20")),
+        ("m3", "set_group_member_mutes",
+         {"group_openid": "G1", "members": [{"op": "add", "member_openid": "U1",
+                                             "mute_expire_at": 1899999999}]},
+         ("POST", "/v2/groups/G1/restrict_chat_setting")),
+        ("m4", "upload_prepare_c2c", {"openid": "U9", "body": {"file_size": 10}},
+         ("POST", "/v2/users/U9/files/upload_prepare")),
+        ("m5", "get_group_bot_state", {"group_openid": "G2"},
+         ("GET", "/v2/groups/G2/bot_state")),
+        ("m6", "demand_guild_api_permission",
+         {"guild_id": "GD1", "path": "/guilds/{guild_id}/members", "method": "GET"},
+         ("POST", "/guilds/GD1/api_permission/demand")),
+        ("m7", "list_join_strategies", {}, ("GET", "/v2/groups/join_approval_strategy")),
+    ]
+    for name, action, args, expect in cases:
+        f = daemon.ACTIONS / f"{name}.json"
+        f.write_text(json.dumps({"action": action, "args": args}), encoding="utf-8")
+        await bridge._handle_action_file(f)
+        result = json.loads((daemon.DONE / f"{name}.result.json").read_text())
+        check(f"v32 actions: {action} -> {expect[0]} {expect[1]}",
+              result.get("ok") is True and expect in api.requests)
+
+
 async def main():
     await t_guest_routing_public()
     await t_guest_routing_private_and_block()
@@ -293,6 +322,7 @@ async def main():
     t_sanitize_config()
     await t_reload_config()
     await t_actions()
+    await t_actions_v32()
     t_admin_http()
     failed = [n for n, ok in RESULTS if not ok]
     print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} passed")

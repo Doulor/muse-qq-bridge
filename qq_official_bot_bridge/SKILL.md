@@ -50,6 +50,7 @@
 - **配置热加载**：daemon 每 5 秒看一次 `config.json` 的 mtime，变了就校验并整体换入（非法值整份拒绝、保留旧配置并记日志）。改配置不用重启；凭据不在热加载范围。
 - **本地管理接口**：`admin_port` > 0 时 daemon 在 127.0.0.1 起一个 HTTP 管理口（`admin.py`，令牌在 `state/admin.token`，请求头 `X-Admin-Token`）：`GET /api/status`、`/api/config`、`/api/guests`、`/api/events?n=`，`PUT /api/config`（走同一套校验），`POST /api/push`（排一条主动消息）。只绑回环，不要往外暴露。
 - **访客 hook**：`hooks/qq-bridge-guest-inbox.sh` 与主人 inbox hook 同款两段式投递（pending 先提交再 peek），指向 `guest_inbox/`，唤醒访客 worker。主人 hook 与访客 hook 必须用各自的提示词，不要混用。
+- **v3.2（2026-11-17 按官方 api-v2 全景目录对账后补齐）**：动作新增 C2C 自定义菜单（`get_menu`/`put_menu`）、指令面板（`list_panels` 等 6 个）、分片上传（prepare/part_finish，C2C 与群各一对）、C2C 流式消息透传（`stream_c2c_message`）、频道接口权限（`get_guild_api_permission`/`demand_guild_api_permission`）、整套群管理（群信息/机器人状态/入群审批/成员禁言/自动审批策略/成员与黑名单——多数要白名单或机器人是群管理员，没权限平台会以 11253/11282 拒绝，如实报）；生命周期事件补录 MESSAGE_REACTION_*、MESSAGE_DELETE、AUDIO_*、SUBSCRIBE_MESSAGE_STATUS、GROUP_JOIN_REQUEST、GROUP_MEMBER_* 等。全景目录见 `references/api-v2-catalog.md`（92 个端点、49+2 个事件，含各 intent 位与权限门槛）。注意：未经平台申请的 intent 不能写进 Identify，未授权 intent 会被平台直接断连（4014）；新事件能否真正收到取决于机器人获批的 intent，不是代码问题。
 
 ## 回信契约（agent 写 outbox）
 
