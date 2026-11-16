@@ -1,0 +1,5 @@
+name: "qq_official_bot_bridge"
+title: "QQ 官方机器人文件桥"
+description: "Build and operate a file bridge between an official QQ bot (Tencent qqbot-agent-sdk) and this agent, so QQ private, group, and channel messages are answered by the agent herself — with owner allowlist, split replies, proactive pushes, and self-healing supervision. Use when setting up, rebuilding, extending, or troubleshooting the QQ bot integration."
+category: "Work and knowledge"
+include_in_prompt: false

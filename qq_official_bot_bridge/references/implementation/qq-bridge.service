@@ -1,0 +1,16 @@
+[Unit]
+Description=QQ Bridge daemon (official QQ Bot <-> Muse file inbox/outbox)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/qq-bridge
+ExecStart=%h/workspace/qq-bridge/.venv/bin/python %h/workspace/qq-bridge/daemon.py
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

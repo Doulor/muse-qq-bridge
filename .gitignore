@@ -1,0 +1,16 @@
+# credentials and local runtime state of a deployed bridge
+credentials.env
+config.json
+inbox/
+outbox/
+proactive/
+events/
+done/
+logs/
+state/
+.venv/
+*.log
+qr.png
+bound.json
+.supervisor.lock
+__pycache__/

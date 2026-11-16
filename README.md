@@ -1,0 +1,53 @@
+# muse-qq-bridge
+
+一句话让 Muse 接入 QQ 官方机器人：把技能包丢给你的 Muse，扫码绑定，几分钟通。
+
+这是一个 [Muse](https://muse.ai) 技能包：QQ 官方机器人收到消息后，由 Muse agent 本人（带自己的人格和记忆）回复，中间不接任何第三方模型。走腾讯官方 Bot API v2 + 官方 `qqbot-agent-sdk`，不用 NapCat 等非官方协议端。
+
+## 它能做什么
+
+- **私聊 / 群 @ / 频道 / 频道私信**收发，含图片、文件、语音附件（语音自动转写，转不出如实标注）
+- **主人白名单**：守护进程入箱前就验 openid，陌生人消息不唤醒 agent；白名单为空时是绑定模式，首位发信人登记待确认
+- **拆条回复**：长答复拆成 2~3 条短消息发，像聊天；单条源消息的回复额度（默认 4）有持久化账本管着
+- **富媒体回复**：agent 可以回图片、视频、语音、文件（msg_type 7）
+- **主动推送**：天气、提醒、动态这类消息直接推到 QQ（`push.py` 一行命令），失败自动重试；另支持平台的互动召回通道（四周期记账）
+- **即时反馈**：消息一到先发「正在输入」状态，不用预设文案占额度
+- **自愈**：网关假死自检退出、flock 监督循环、看门狗 hook 重启循环检测；每条消息的最终结局（SENT / PARTIAL / EXPIRED / FAILED…）都归档可查
+- **两段式唤醒**：消息先 peek 再提交已读，不存在「标记了却没唤醒」的丢消息窗口
+
+## 快速开始
+
+1. 在 [QQ 开放平台](https://q.qq.com) 创建机器人（个人主体可自用：自有群 + 开发期体验用户私聊）。
+2. 把本仓库的 `qq_official_bot_bridge/` 文件夹交给你的 Muse，说「按这个 skill 给我接 QQ」。
+3. Muse 会照着 SKILL.md 搭好桥，你扫码选机器人完成绑定（AppSecret 不经过聊天），再在主聊天确认一次白名单，就能用了。
+
+手动部署、配置字段、SDK 已知限制和排障都在技能包的运维手册里：`qq_official_bot_bridge/references/implementation/README.md`。
+
+## 设计取舍（踩坑实录）
+
+- 被动回复窗口：官方文档自相矛盾（同页一处 60 分钟、一处 5 分钟），默认按 5 分钟保守守卫，超窗回复归档 EXPIRED 不硬发；实测能更晚的可以调 `reply_window_seconds`。
+- msg_seq：SDK 的生成器是 0–65535 伪随机，撞号会被平台按重复消息静默丢弃——daemon 按 msg_id 做持久化序号登记，撞了顺延，失败不复用。
+- 两个 hook 严格分工：一个管消息唤醒，一个管进程死活。合并脚本的超时和故障会互相污染，这是实测教训。
+- systemd 用户服务备而不用：很多 VM 连不上用户总线，`run.sh` 的 flock 监督循环在哪都能跑。
+
+## 结构
+
+```
+qq_official_bot_bridge/
+├── SKILL.md                    # 技能说明（给 Muse 读的搭建与运维规程）
+├── skill.yaml
+└── references/
+    ├── inbox-hook-prompt.txt   # 唤醒 agent 时的回信提示词模板
+    └── implementation/         # 完整参考实现
+        ├── daemon.py           # 守护进程（收发/白名单/自检）
+        ├── push.py             # 主动推送 CLI
+        ├── run.sh              # flock 监督循环
+        ├── hooks/              # inbox 唤醒 + watchdog 保活
+        ├── qr-connect/         # 扫码绑定（官方 connector）
+        ├── tests/              # 离线测试（33 项，不联网不用凭据）
+        └── README.md           # 运维手册
+```
+
+## 许可
+
+MIT。参考实现借鉴了两个独立 Muse QQ 桥接项目（2026 年 11 月）的设计与实测结论，在此致谢。

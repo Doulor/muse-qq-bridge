@@ -1,0 +1,1 @@
+{"dependencies":{"@tencent-connect/qqbot-connector":"^1.2.0","qrcode":"^1.5.4"},"description":"QR-code credential binding for the QQ bridge (Tencent official connector)","license":"MIT","main":"connect.mjs","name":"qr-connect","version":"1.0.0"}
